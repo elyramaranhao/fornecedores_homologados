@@ -1,6 +1,5 @@
 import io
 import re
-import unicodedata
 from typing import Dict, List, Any, Iterable
 
 import streamlit as st
@@ -8,30 +7,24 @@ from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
 
-# =====================================================
-# Utilidades
-# =====================================================
-
 PH_RE = re.compile(r"\{\{([^}]+)\}\}")
 
-def strip_accents(s: str) -> str:
-    import unicodedata
-    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-
+# --------------------------
+# Utilitários
+# --------------------------
 def normalize_key(s: str) -> str:
-    s = strip_accents(s)
+    import unicodedata
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
     s = re.sub(r"[^A-Za-z0-9]+", "_", s)
     return s.strip("_").upper()
 
 def iter_all_paragraphs(doc: Document) -> Iterable:
-    # corpo
     for p in doc.paragraphs:
         yield p
-    # tabelas
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
+    for t in doc.tables:
+        for r in t.rows:
+            for c in r.cells:
+                for p in c.paragraphs:
                     yield p
 
 def collect_placeholders(doc: Document) -> List[str]:
@@ -48,42 +41,11 @@ def collect_placeholders(doc: Document) -> List[str]:
                 for p in hf.paragraphs:
                     for ph in PH_RE.findall(p.text or ""):
                         found.add(ph.strip())
-    return sorted(found, key=lambda x: x.lower())
+    return sorted(found, key=str.lower)
 
-def replace_in_paragraph(p, mapping: Dict[str, Any]) -> bool:
-    """Substitui placeholders respeitando runs quebrados."""
-    full = "".join(run.text for run in p.runs)
-    if not full:
-        return False
-    placeholders = PH_RE.findall(full)
-    if not placeholders:
-        return False
-    new_full = full
-    for raw in placeholders:
-        raw_key = raw.strip()
-        # tenta exatamente e a versão normalizada
-        val = mapping.get(raw_key)
-        if val is None:
-            val = mapping.get(normalize_key(raw_key))
-        if val is None:
-            val = ""
-        new_full = new_full.replace("{{" + raw_key + "}}", str(val))
-    if new_full != full:
-        if not p.runs:
-            p.add_run(new_full)
-        else:
-            p.runs[0].text = new_full
-            for r in p.runs[1:]:
-                r.text = ""
-        return True
-    return False
-
-def paragraph_contains_any(p, needles: List[str]) -> bool:
-    t = p.text or ""
-    return any((n.strip().lower() in t.lower()) for n in needles if n.strip())
-
-def apply_font_to_paragraph(p, font_name: str, size_pt: int, bold: bool):
-    for run in p.runs:
+def apply_font_family_and_size(paragraph, font_name: str, size_pt: int):
+    # NÃO mexe em bold/itálico; só fonte e tamanho
+    for run in paragraph.runs:
         run.font.name = font_name
         rPr = run._element.rPr
         if rPr is not None and rPr.rFonts is not None:
@@ -91,47 +53,111 @@ def apply_font_to_paragraph(p, font_name: str, size_pt: int, bold: bool):
             rPr.rFonts.set(qn('w:hAnsi'), font_name)
             rPr.rFonts.set(qn('w:eastAsia'), font_name)
         run.font.size = Pt(size_pt)
-        run.font.bold = bold
+
+def replace_within_run_text(run, mapping: Dict[str, Any]) -> bool:
+    """Substitui {{CHAVE}} dentro de UM run mantendo o estilo do run."""
+    txt = run.text or ""
+    if "{{" not in txt:
+        return False
+    placeholders = PH_RE.findall(txt)
+    if not placeholders:
+        return False
+    new_txt = txt
+    for raw in placeholders:
+        k = raw.strip()
+        val = mapping.get(k)
+        if val is None:
+            val = mapping.get(normalize_key(k))
+        if val is None:
+            val = ""
+        new_txt = new_txt.replace("{{" + k + "}}", str(val))
+    if new_txt != txt:
+        run.text = new_txt
+        return True
+    return False
+
+def replace_across_runs_preserving_first_style(paragraph, mapping: Dict[str, Any]) -> bool:
+    """
+    Trata casos em que a chave {{...}} está quebrada em múltiplos runs.
+    Junta runs de um 'bloco' que contenha ao menos um placeholder completo,
+    faz o replace e grava tudo no PRIMEIRO run do bloco, apagando texto dos demais.
+    Mantém o estilo (incluindo bold) do primeiro run do bloco.
+    """
+    runs = list(paragraph.runs)
+    if not runs:
+        return False
+
+    changed_any = False
+    i = 0
+    while i < len(runs):
+        txt = runs[i].text or ""
+        if "{{" in txt and "}}" in txt:
+            # placeholder inteiro no mesmo run: já foi tratado por replace_within_run_text
+            i += 1
+            continue
+        if "{{" in txt and "}}" not in txt:
+            # possível começo de placeholder quebrado
+            j = i
+            block_text = txt
+            while j + 1 < len(runs) and "}}" not in block_text:
+                j += 1
+                block_text += runs[j].text or ""
+            if "}}" in block_text:
+                # achou um bloco com placeholder completo
+                new_block = block_text
+                placeholders = PH_RE.findall(block_text)
+                for raw in placeholders:
+                    k = raw.strip()
+                    val = mapping.get(k)
+                    if val is None:
+                        val = mapping.get(normalize_key(k))
+                    if val is None:
+                        val = ""
+                    new_block = new_block.replace("{{" + k + "}}", str(val))
+                if new_block != block_text:
+                    # grava no primeiro run do bloco; preserva estilo dele (negrito, etc.)
+                    runs[i].text = new_block
+                    for x in range(i + 1, j + 1):
+                        runs[x].text = ""
+                    changed_any = True
+                i = j + 1
+                continue
+        i += 1
+
+    return changed_any
+
+def replace_placeholders_preserving_bold(paragraph, mapping: Dict[str, Any]) -> bool:
+    """
+    1) Primeiro tenta substituir dentro de runs (mantém bold original do run).
+    2) Depois tenta blocos multi-run (quando {{...}} está quebrado entre runs).
+    """
+    changed = False
+    for run in paragraph.runs:
+        if replace_within_run_text(run, mapping):
+            changed = True
+    if replace_across_runs_preserving_first_style(paragraph, mapping):
+        changed = True
+    return changed
 
 def process_document(template_bytes: bytes,
                      mapping: Dict[str, Any],
                      font_name: str,
-                     font_size: int,
-                     bold_all: bool,
-                     exceptions_contains: List[str],
-                     exceptions_placeholders: List[str]) -> bytes:
-    """Retorna bytes do DOCX final."""
+                     font_size: int) -> bytes:
     doc = Document(io.BytesIO(template_bytes))
 
-    # Replace em corpo + tabelas
+    # Corpo + tabelas
     for p in iter_all_paragraphs(doc):
-        replace_in_paragraph(p, mapping)
+        replace_placeholders_preserving_bold(p, mapping)
+        apply_font_family_and_size(p, font_name, font_size)
 
-    # Replace em header/footer
+    # Headers/Footers
     for sec in doc.sections:
         for hf in [sec.header, sec.first_page_header, sec.even_page_header,
                    sec.footer, sec.first_page_footer, sec.even_page_footer]:
             if hf:
                 for p in hf.paragraphs:
-                    replace_in_paragraph(p, mapping)
-
-    # Tipografia + regra de negrito
-    exc_ph_norm = {normalize_key(x) for x in exceptions_placeholders}
-    for p in iter_all_paragraphs(doc):
-        is_exc_text = paragraph_contains_any(p, exceptions_contains)
-        tnorm = normalize_key(p.text or "")
-        is_exc_ph = any(k in tnorm for k in exc_ph_norm)
-        apply_font_to_paragraph(p, font_name, font_size, bold_all and not (is_exc_text or is_exc_ph))
-
-    for sec in doc.sections:
-        for hf in [sec.header, sec.first_page_header, sec.even_page_header,
-                   sec.footer, sec.first_page_footer, sec.even_page_footer]:
-            if hf:
-                for p in hf.paragraphs:
-                    is_exc_text = paragraph_contains_any(p, exceptions_contains)
-                    tnorm = normalize_key(p.text or "")
-                    is_exc_ph = any(k in tnorm for k in exc_ph_norm)
-                    apply_font_to_paragraph(p, font_name, font_size, bold_all and not (is_exc_text or is_exc_ph))
+                    replace_placeholders_preserving_bold(p, mapping)
+                    apply_font_family_and_size(p, font_name, font_size)
 
     out = io.BytesIO()
     doc.save(out)
@@ -141,72 +167,58 @@ def process_document(template_bytes: bytes,
 def safe_filename(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "-", str(name)).strip()
 
-# =====================================================
+# --------------------------
 # UI
-# =====================================================
-
-st.set_page_config(page_title="Fornecedores Homologados — Automação", page_icon="🧩", layout="wide")
+# --------------------------
+st.set_page_config(page_title="Carta de Homologação — Preenchimento", page_icon="🧰", layout="wide")
 st.title("Carta de Homologação de Fornecedores — Preenchimento por {{Chaves}}")
+st.caption("Suba o modelo .docx → detectamos as {{CHAVES}} → você preenche → baixamos o .docx final. "
+           "Negrito é **preservado exatamente como no modelo**; apenas fonte e tamanho são uniformizados para Calibri 11.")
 
-st.markdown("**Fluxo:** ① Suba o modelo `.docx` → ② O app detecta as `{{CHAVES}}` → ③ Você preenche → ④ Baixe o `.docx` (e opcional `.pdf`).")
 st.divider()
 
-# 1) Upload do modelo
 template_file = st.file_uploader("Modelo .docx (com placeholders {{CHAVE}})", type=["docx"], accept_multiple_files=False)
 
-# 2) Config de tipografia
 with st.sidebar:
     st.header("Configurações")
     font_name = st.text_input("Fonte", value="Calibri")
-    font_size = st.number_input("Tamanho (pt)", 8, 20, 11, 1)
-    bold_all = st.checkbox("Negrito por padrão (todo documento)", value=True)
-    try_pdf = st.checkbox("Tentar exportar PDF (pode não funcionar no Cloud)", value=False)
-    st.caption("PDF depende de Word/LibreOffice no host; em alguns ambientes não estará disponível.")
+    font_size = st.number_input("Tamanho (pt)", min_value=8, max_value=20, value=11, step=1)
+    st.caption("Obs.: não alteramos negrito; apenas fonte/tamanho para uniformizar o documento.")
 
-    st.markdown("---")
-    st.subheader("Exceções (não negritar)")
-    exc_contains = st.text_area("Exceções por **texto contido** no parágrafo (1 por linha):",
-                                value="Descrever aqui os produtos ou serviços aprovados.").splitlines()
-    exc_placeholders = st.text_area("Exceções por **placeholder** (a chave cujos valores não ficam em negrito, 1 por linha):",
-                                    value="DESCRICAO_PRODUTOS_SERVICOS").splitlines()
-
-# 3) Detectar chaves e montar formulário
 if template_file:
     try:
-        tmp = Document(template_file)
-        placeholders = collect_placeholders(tmp)
-        st.success(f"Placeholders detectados ({len(placeholders)}): {placeholders if placeholders else '—'}")
+        tmp_doc = Document(template_file)
+        keys = collect_placeholders(tmp_doc)
+        st.success(f"Placeholders encontrados ({len(keys)}): {keys if keys else '—'}")
 
-        with st.form("form_preenchimento"):
-            st.subheader("Preencha os valores das {{Chaves}}")
-            st.caption("Dica: campos em branco serão substituídos por vazio.")
+        with st.form("form"):
+            st.subheader("Preencha os valores para as {{Chaves}} detectadas")
             values: Dict[str, Any] = {}
 
+            # layout em 2 colunas para agilizar preenchimento
             col1, col2 = st.columns(2)
-            half = (len(placeholders) + 1) // 2
-            left_keys = placeholders[:half]
-            right_keys = placeholders[half:]
+            half = (len(keys) + 1) // 2
+            left, right = keys[:half], keys[half:]
 
             with col1:
-                for k in left_keys:
+                for k in left:
                     values[k] = st.text_input(k, value="")
             with col2:
-                for k in right_keys:
+                for k in right:
                     values[k] = st.text_input(k, value="")
 
-            output_name = st.text_input("Nome do arquivo de saída (.docx)",
-                                        value="Homologacao - {RAZAO_SOCIAL_DO_FORNECEDOR}.docx")
+            out_name = st.text_input("Nome do arquivo (.docx)", value="Homologacao - {RAZAO_SOCIAL_DO_FORNECEDOR}.docx")
             submitted = st.form_submit_button("Gerar documento")
 
         if submitted:
-            # Monta mapping com chaves originais e normalizadas
+            # mapping com chaves originais e normalizadas
             mapping: Dict[str, Any] = {}
             for k, v in values.items():
                 mapping[k] = v
                 mapping[normalize_key(k)] = v
 
-            # Nome do arquivo (substitui tokens por valores preenchidos também)
-            final_name = output_name
+            # nome final com tokens
+            final_name = out_name
             for k, v in values.items():
                 final_name = final_name.replace("{"+k+"}", safe_filename(v))
                 final_name = final_name.replace("{"+normalize_key(k)+"}", safe_filename(v))
@@ -214,44 +226,23 @@ if template_file:
                 final_name += ".docx"
             final_name = safe_filename(final_name) or "Homologacao.docx"
 
-            # Recarrega bytes do modelo (file_uploader avança o ponteiro)
+            # reabrir bytes do modelo (reposiciona ponteiro)
             template_file.seek(0)
             template_bytes = template_file.read()
 
-            # Processa DOCX
-            out_docx_bytes = process_document(
+            # processar
+            docx_bytes = process_document(
                 template_bytes=template_bytes,
                 mapping=mapping,
                 font_name=font_name,
                 font_size=int(font_size),
-                bold_all=bold_all,
-                exceptions_contains=[s for s in exc_contains if s.strip()],
-                exceptions_placeholders=[s for s in exc_placeholders if s.strip()],
             )
 
-            st.download_button("⬇️ Baixar DOCX", data=out_docx_bytes, file_name=final_name, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
-            # PDF opcional
-            if try_pdf:
-                try:
-                    # Tentativa de docx2pdf local (pode falhar no Cloud)
-                    from docx2pdf import convert  # noqa: F401
-                    import tempfile, os
-                    with tempfile.TemporaryDirectory() as td:
-                        tmp_docx = f"{td}/tmp.docx"
-                        tmp_pdf = f"{td}/tmp.pdf"
-                        with open(tmp_docx, "wb") as f:
-                            f.write(out_docx_bytes)
-                        # convert precisa de caminho; saída direta
-                        convert(tmp_docx, tmp_pdf)  # type: ignore
-                        with open(tmp_pdf, "rb") as f:
-                            pdf_bytes = f.read()
-                    pdf_name = final_name.replace(".docx", ".pdf")
-                    st.download_button("⬇️ Baixar PDF", data=pdf_bytes, file_name=pdf_name, mime="application/pdf")
-                except Exception as e:
-                    st.info(f"Não foi possível gerar PDF neste ambiente: {e}")
+            st.download_button("⬇️ Baixar DOCX", data=docx_bytes,
+                               file_name=final_name,
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
     except Exception as e:
-        st.error(f"Falha ao ler o modelo: {e}")
+        st.error(f"Erro ao ler o modelo: {e}")
 else:
     st.info("Envie o modelo .docx para começar.")
